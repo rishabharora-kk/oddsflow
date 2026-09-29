@@ -13,7 +13,7 @@ import type { PantaLike, SolamiLike } from "./engine.ts";
 import { categoryRank, extractCategory, extractMarketId, extractTitle } from "./panta/extract.ts";
 import { redactSecrets } from "./util/redact.ts";
 
-/** Maximum detail requests used to learn market text for list rows that have no title. */
+/** Default maximum detail requests used to learn market text for list rows that have no title. */
 const MAX_DETAILS = 60;
 
 export type LiveCheckDeps = {
@@ -56,11 +56,13 @@ export async function runLiveCheck(env: Record<string, string | undefined>, deps
   // commodities and finance first, at most MAX_DETAILS) and parse the detail text.
   const programIds = new Set<string>();
   const detailByIndex = new Map<number, any>();
+  const cap = Number.parseInt(env.ODDSFLOW_MAX_DETAILS ?? "", 10);
+  const maxDetails = Number.isFinite(cap) && cap > 0 ? Math.min(cap, 500) : MAX_DETAILS;
   const needText = items
     .map((item, index) => ({ item, index }))
     .filter(({ item }) => extractTitle(item) === "" && extractMarketId(item) !== null)
     .sort((a, b) => categoryRank(extractCategory(a.item)) - categoryRank(extractCategory(b.item)) || a.index - b.index)
-    .slice(0, MAX_DETAILS);
+    .slice(0, maxDetails);
   let detailFailures = 0;
   for (const { item, index } of needText) {
     try {
@@ -123,6 +125,10 @@ export async function runLiveCheck(env: Record<string, string | undefined>, deps
   for (const [k, n] of Object.entries(byKind).sort()) log(`  ${k}: ${n}`);
   if (Object.keys(byKind).length === 0) log("  (none)");
   log(`unsupported: ${unsupported}`);
+  const nowSec = Math.floor(Date.now() / 1000);
+  const live = parsed.filter((p) => p.contract.expiry > nowSec);
+  log(`unexpired parsed: ${live.length}`);
+  for (const p of live) log(`  live: ${JSON.stringify(p.title)} -> ${JSON.stringify(p.contract)}`);
   log("example parsed markets:");
   for (const p of parsed.slice(0, 5)) log(`  ${JSON.stringify(p.title)} -> ${JSON.stringify(p.contract)}`);
 
