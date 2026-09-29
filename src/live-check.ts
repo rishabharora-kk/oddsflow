@@ -93,6 +93,19 @@ export async function runLiveCheck(env: Record<string, string | undefined>, deps
   }
 
   if (env.ODDSFLOW_DIAG === "1") {
+    // Inventory by phase: how many markets exist outside primary/secondary (e.g. P2P, resolved)?
+    for (const status of [undefined, "resolved", "cancelled"]) {
+      try {
+        const rows = await panta.listMarkets(status ? { status } : {});
+        const phases: Record<string, number> = {};
+        for (const r of rows) phases[String(r?.phase)] = (phases[String(r?.phase)] ?? 0) + 1;
+        const titled = rows.filter((r: any) => extractTitle(r) !== "");
+        const priceLike = titled.filter((r: any) => parseMarket({ title: r?.title }) !== null).length;
+        log(`diag: inventory status=${status ?? "(none)"} rows=${rows.length} phases=${JSON.stringify(phases)} titled=${titled.length} parseable-by-list-title=${priceLike}`);
+      } catch (e) {
+        log(`diag: inventory status=${status ?? "(none)"} failed: ${safe(e)}`);
+      }
+    }
     // Shape diagnostics for the live API. Market text is public; no key material is printed.
     const keys = new Set<string>();
     for (const it of items) for (const k of Object.keys(it ?? {})) keys.add(k);
