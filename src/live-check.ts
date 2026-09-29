@@ -62,6 +62,28 @@ export async function runLiveCheck(env: Record<string, string | undefined>, deps
     byKind[contract.kind] = (byKind[contract.kind] ?? 0) + 1;
   }
 
+  if (env.ODDSFLOW_DIAG === "1") {
+    // Shape diagnostics for the live API. Market text is public; no key material is printed.
+    const keys = new Set<string>();
+    for (const it of items) for (const k of Object.keys(it ?? {})) keys.add(k);
+    const nonEmpty = (f: string) => items.filter((it) => typeof it?.[f] === "string" && it[f].trim() !== "").length;
+    log(`diag: list row keys: ${[...keys].sort().join(",")}`);
+    log(`diag: non-empty title=${nonEmpty("title")} question=${nonEmpty("question")} description=${nonEmpty("description")}`);
+    for (const it of items.slice(0, 8)) log(`diag: list title=${JSON.stringify(it?.title)} category=${JSON.stringify(it?.category)}`);
+    for (const it of items.slice(0, 10)) {
+      const id = extractMarketId(it);
+      if (!id) continue;
+      try {
+        const d = await panta.getMarket(id);
+        const text = String(d?.title || d?.question || "");
+        log(`diag: detail keys=${Object.keys(d ?? {}).sort().join(",")}`);
+        log(`diag: detail text=${JSON.stringify(text.slice(0, 160))} yes=${JSON.stringify(d?.yesPrice)} -> ${JSON.stringify(parseMarket({ title: d?.title, question: d?.question }))}`);
+      } catch (e) {
+        log(`diag: detail failed: ${safe(e)}`);
+      }
+    }
+  }
+
   log(`total markets: ${items.length}`);
   log("parsed contracts by kind:");
   for (const [k, n] of Object.entries(byKind).sort()) log(`  ${k}: ${n}`);
