@@ -1,0 +1,16 @@
+{
+  "name": "oddsflow",
+  "version": "0.1.0",
+  "description": "Read-only fair-probability analytics for Panta prediction markets, priced from Solana DEX data via Solami.",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --experimental-strip-types --test \"test/**/*.test.ts\"",
+    "start": "node --experimental-strip-types src/server.ts",
+    "live-check": "node --experimental-strip-types src/live-check.ts"
+  }
+}
