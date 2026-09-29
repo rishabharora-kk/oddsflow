@@ -1,9 +1,19 @@
-/** The single static HTML page (inline CSS and JS). Market titles are untrusted text: the client only ever uses textContent. */
-export const PAGE = String.raw`<!doctype html>
+import { rowIsStale, snapshotAgeMin } from "./page-logic.ts";
+
+export const REPO_URL = "https://github.com/rishabharora-kk/oddsflow";
+
+/**
+ * The page template (inline CSS and JS). Market titles are untrusted text: the client only ever uses textContent.
+ * One UI, two modes, chosen by the __MODE__ token:
+ *  - "live": rows come from /api/rows and /events (SSE) of the running server.
+ *  - "static": rows come from a single ./rows.json written by `npm run snapshot` (GitHub Pages).
+ */
+const TEMPLATE = String.raw`<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<!--CSP-->
 <title>oddsflow</title>
 <style>
   :root {
@@ -51,14 +61,17 @@ export const PAGE = String.raw`<!doctype html>
   .radar { background: var(--panel); border: 1px solid var(--line); border-left: 4px solid var(--link); padding: 8px 12px; border-radius: 6px; margin: 8px 0; }
   .radar ul { margin: 4px 0 0; padding-left: 18px; }
   .badge.launch { color: var(--link); border-color: var(--link); font-weight: 600; letter-spacing: .02em; }
+  .snapshot { font-size: 15px; font-weight: 600; border-left-color: var(--link); }
+  .snapshot.old { border-left-color: var(--neg); color: var(--neg); }
   .empty { padding: 24px; text-align: center; color: var(--muted); }
 </style>
 </head>
 <body>
 <header>
   <h1>oddsflow</h1>
-  <p class="sub">Fair probabilities for Panta price markets, computed from live Solana DEX prices and realised volatility.</p>
+  <p class="sub">Fair probabilities for Panta price markets, priced from the underlying asset: Hyperliquid reference prices for majors, Solana DEX data (Solami) for Solana assets, and realised volatility.</p>
   <div class="banner" role="note">Read-only analytics. Not financial advice.</div>
+<!--SNAPSHOT-->
   <div class="radar" id="radar" role="region" aria-label="Launch radar"></div>
   <div class="status" id="status" aria-live="polite"></div>
 </header>
@@ -71,10 +84,12 @@ export const PAGE = String.raw`<!doctype html>
     <div class="empty" id="empty" hidden></div>
   </div>
 </main>
-<footer><span>Powered by Panta</span><span>Data: Solami</span><span>Reference prices: Hyperliquid</span></footer>
+<footer><span>Powered by Panta</span><span>Data: Solami</span><span>Reference prices: Hyperliquid</span><span><a href="__REPO__" rel="noopener noreferrer">Source on GitHub</a></span></footer>
 <script>
 (function () {
   "use strict";
+  var MODE = "__MODE__";
+__LOGIC__
   var COLS = [
     { key: "title", label: "Market", get: function (r) { return r.title; }, text: true },
     { key: "venue", label: "Venue", get: function (r) { return r.venue ? VENUE[r.venue] || r.venue : null; }, text: true },
@@ -88,7 +103,7 @@ export const PAGE = String.raw`<!doctype html>
     { key: "asOf", label: "Updated", get: function (r) { return r.asOf; } }
   ];
   var VENUE = { hyperliquid: "Hyperliquid mid", solami: "Solami DEX" };
-  var rows = [], status = null, sort = { key: "edge", dir: -1, abs: true }, open = {}, connected = false, lastPush = null, showAll = false;
+  var rows = [], status = null, sort = { key: "edge", dir: -1, abs: true }, open = {}, connected = false, lastPush = null, showAll = false, snap = null, snapError = false;
 
   function el(tag, cls, text) {
     var e = document.createElement(tag);
@@ -140,7 +155,8 @@ export const PAGE = String.raw`<!doctype html>
 
   function sorted() {
     var col = COLS.filter(function (c) { return c.key === sort.key; })[0] || COLS[0];
-    var list = rows.filter(function (r) { return showAll || r.fair !== null || r.reason !== "unparsed"; });
+    var hidden = { unparsed: 1, resolved: 1, expired: 1 };
+    var list = rows.filter(function (r) { return showAll || r.fair !== null || !hidden[r.reason]; });
     return list.slice().sort(function (a, b) {
       var x = col.get(a), y = col.get(b);
       if (x === null || x === undefined) return (y === null || y === undefined) ? 0 : 1;
@@ -183,7 +199,8 @@ export const PAGE = String.raw`<!doctype html>
     add("Spot as of", r.asOf ? new Date(r.asOf * 1000).toISOString() : null);
     add("Panta price as of", r.yesAsOf ? new Date(r.yesAsOf * 1000).toISOString() : null);
     if (r.staleReasons && r.staleReasons.length) add("Stale because", r.staleReasons.join("; "));
-    if (!connected) add("Connection", "lost, showing last received data");
+    if (MODE === "static" && !r.stale && isStale(r)) add("Stale because", "this snapshot is more than 20 minutes old");
+    if (MODE === "live" && !connected) add("Connection", "lost, showing last received data");
     (r.notes || []).forEach(function (n) { add("Note", n); });
     td.appendChild(dl);
     var tr = el("tr", "detail"); tr.appendChild(td);
@@ -202,7 +219,7 @@ export const PAGE = String.raw`<!doctype html>
     b.addEventListener("click", function () { open[r.marketId] = !open[r.marketId]; render(); });
     c0.appendChild(b);
     if (r.launchBlind) c0.appendChild(el("span", "badge launch", "LAUNCH @50/50"));
-    if (r.fair !== null && isStale(r)) c0.appendChild(el("span", "badge stale", "stale"));
+    if (r.fair !== null && isStale(r)) c0.appendChild(el("span", "badge stale", "STALE"));
     tr.appendChild(c0);
     tr.appendChild(el("td", r.venue ? null : "muted", r.venue ? (VENUE[r.venue] || r.venue) : "\u2014"));
 
@@ -226,7 +243,9 @@ export const PAGE = String.raw`<!doctype html>
     tr.appendChild(tdu);
     return tr;
   }
-  function isStale(r) { return r.stale || !connected; }
+  function isStale(r) {
+    return rowIsStale(r, { mode: MODE, connected: connected, generatedAt: snap ? snap.generatedAt : null, nowSec: Date.now() / 1000 });
+  }
 
   function renderRadar() {
     var box = document.getElementById("radar");
@@ -248,7 +267,7 @@ export const PAGE = String.raw`<!doctype html>
         if (/^https:\/\/www\.panta\.market\/market\//.test(r.url)) { a.href = r.url; a.target = "_blank"; a.rel = "noopener noreferrer"; }
         li.appendChild(a);
         li.appendChild(document.createTextNode(" \u2014 Panta " + (r.yes === null ? "n/a" : r.yes.toFixed(2)) + " vs fair " + r.fair.toFixed(2)));
-        if (isStale(r)) li.appendChild(el("span", "badge stale", "stale"));
+        if (isStale(r)) li.appendChild(el("span", "badge stale", "STALE"));
         ul.appendChild(li);
       });
       box.appendChild(ul);
@@ -258,8 +277,14 @@ export const PAGE = String.raw`<!doctype html>
   function renderStatus() {
     var s = document.getElementById("status");
     s.textContent = "";
-    if (!connected) s.appendChild(el("span", "bad", "Disconnected from server: data below is not live."));
-    if (status) {
+    if (MODE === "live" && !connected) s.appendChild(el("span", "bad", "Disconnected from server: data below is not live."));
+    if (MODE === "static" && snap && snap.sources) {
+      Object.keys(snap.sources).forEach(function (k) {
+        var v = String(snap.sources[k]);
+        s.appendChild(el("span", /^error/.test(v) ? "bad" : null, k + ": " + v));
+      });
+    }
+    if (MODE === "live" && status) {
       s.appendChild(el("span", null, status.supported + " of " + status.markets + " markets supported"));
       if (status.streamMode) s.appendChild(el("span", null, "spot feed: " + (status.streamMode === "stream" ? "live stream" : "REST polling (15 s)")));
       if (status.error) s.appendChild(el("span", "bad", status.error));
@@ -268,13 +293,30 @@ export const PAGE = String.raw`<!doctype html>
     }
     if (lastPush) s.appendChild(el("span", null, "last update " + ago(lastPush)));
     var lab = el("label"); var cb = el("input"); cb.type = "checkbox"; cb.checked = showAll;
-    cb.addEventListener("change", function () { showAll = cb.checked; if (showAll) fetchRows(true); render(); });
-    lab.appendChild(cb); lab.appendChild(document.createTextNode(" show unsupported markets"));
+    cb.addEventListener("change", function () { showAll = cb.checked; if (showAll && MODE === "live") fetchRows(true); render(); });
+    lab.appendChild(cb); lab.appendChild(document.createTextNode(" show unsupported and inactive markets"));
     s.appendChild(lab);
+  }
+
+  function renderSnapshotBanner() {
+    var b = document.getElementById("snapshot");
+    if (!b) return;
+    if (!snap) {
+      if (snapError) { b.textContent = "Could not load the snapshot (rows.json). Nothing below is live."; b.className = "banner snapshot old"; }
+      return;
+    }
+    var now = Date.now() / 1000;
+    var min = snapshotAgeMin(snap.generatedAt, now);
+    var old = rowIsStale({}, { mode: "static", generatedAt: snap.generatedAt, nowSec: now });
+    b.textContent = "Snapshot generated " + new Date(snap.generatedAt * 1000).toLocaleString() + " (" + min + " min ago). " +
+      "Updated every ~10 minutes by GitHub Actions. Not live streaming." +
+      (old ? " This snapshot is more than 20 minutes old: every row is STALE." : "");
+    b.className = "banner snapshot" + (old ? " old" : "");
   }
 
   function render() {
     renderHead();
+    renderSnapshotBanner();
     renderRadar();
     renderStatus();
     var body = document.getElementById("body");
@@ -304,13 +346,61 @@ export const PAGE = String.raw`<!doctype html>
     es.addEventListener("error", function () { connected = false; render(); });
   }
 
+  function loadSnapshot() {
+    fetch("./rows.json", { cache: "no-store" }).then(function (r) { return r.json(); }).then(function (j) {
+      if (!j || !Array.isArray(j.rows) || typeof j.generatedAt !== "number") throw new Error("bad snapshot");
+      snap = j;
+      rows = j.rows;
+      status = {
+        markets: rows.length,
+        supported: rows.filter(function (r) { return r.reason !== "unparsed"; }).length,
+        launchBlind: typeof j.launchBlindCount === "number" ? j.launchBlindCount : undefined,
+        streamMode: null, error: null, hasPanta: true, hasSolami: true
+      };
+      render();
+    }).catch(function () { snapError = true; render(); });
+  }
+
   render();
-  fetchRows(false);
-  fetchStatus();
-  connect();
+  if (MODE === "static") {
+    loadSnapshot();
+  } else {
+    fetchRows(false);
+    fetchStatus();
+    connect();
+  }
   setInterval(render, 5000);
 })();
 </script>
 </body>
 </html>
 `;
+
+const logicSource = [rowIsStale, snapshotAgeMin].map((f) => f.toString()).join("\n");
+
+function build(mode: "live" | "static", banner: string): string {
+  return TEMPLATE
+    .replace("__MODE__", mode)
+    .replace("__LOGIC__", () => logicSource)
+    .replace("__REPO__", REPO_URL)
+    .replace("<!--SNAPSHOT-->", () => banner)
+    .replace(
+      "<!--CSP-->",
+      mode === "static"
+        ? `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'none'">`
+        : "",
+    );
+}
+
+/** The page served by the live server. */
+export const PAGE = build("live", "");
+
+/**
+ * The page published to GitHub Pages. The banner is pre-rendered with the snapshot's UTC time so that it reads
+ * correctly even before the script runs; the script then replaces it with local time and the age in minutes.
+ */
+export function buildStaticPage(generatedAtSec: number): string {
+  const iso = new Date(generatedAtSec * 1000).toISOString();
+  const banner = `  <div class="banner snapshot" id="snapshot" role="status">Snapshot generated ${iso}. Updated every ~10 minutes by GitHub Actions. Not live streaming.</div>`;
+  return build("static", banner);
+}

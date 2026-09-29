@@ -79,9 +79,25 @@ export SOLAMI_API_KEY=...    # Solami data API key
 npm test                     # unit tests (node:test), no network
 npm start                    # serves http://localhost:3000  (PORT and HOST env vars are honoured)
 npm run live-check           # smoke test against the real APIs; prints counts only
+npm run snapshot             # one-shot static snapshot into dist/ (what GitHub Pages publishes)
 ```
 
 Keys are read only from those two environment variables and are never logged, printed or served. The `live-check` GitHub Actions workflow (`workflow_dispatch` only) runs the tests and the live check with the keys from repository secrets.
+
+## Live snapshot
+
+Public URL: **https://rishabharora-kk.github.io/oddsflow/**
+
+There is no server behind it. A scheduled GitHub Action (`.github/workflows/pages.yml`, every 10 minutes, on manual dispatch and on push to `main`) runs the tests, then `npm run snapshot`, which runs the engine's full refresh once (Panta list and details, Hyperliquid mids and candles, Solami if `SOLAMI_API_KEY` is set) and writes:
+
+- `dist/rows.json`: `{generatedAt, generatedAtIso, launchBlindCount, rows, sources}`, where `rows` are the same objects as `/api/rows?all=1` and `sources` records `ok`, `not configured` or `error: ...` for Panta, Hyperliquid and Solami;
+- `dist/index.html`: the same UI as the live server, in static mode. It fetches `./rows.json` once.
+
+The workflow then publishes `dist/` to GitHub Pages. This is a **10-minute snapshot, not a stream**. The page says so in a banner with the snapshot time and its age, and shows every row as STALE once the snapshot is more than 20 minutes older than the viewer's clock.
+
+If Panta fails, `npm run snapshot` exits 1 and writes nothing, so the job fails and the previous deployment stays up. Other sources failing does not fail the run; it is recorded in `sources` and the affected rows say why they have no fair value. Keys come only from repository secrets and are never written to `dist/`. To enable it, set Settings > Pages > Source to "GitHub Actions" and add the `PANTA_API_KEY` and `SOLAMI_API_KEY` secrets.
+
+Run it locally with `npm run snapshot` and serve `dist/` with any static file server.
 
 ## Read-only guarantees
 

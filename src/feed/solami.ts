@@ -189,7 +189,7 @@ export class SolamiClient {
   constructor(opts: SolamiClientOptions) {
     this.#apiKey = opts.apiKey;
     this.baseUrl = (opts.baseUrl ?? SOLAMI_BASE_URL).replace(/\/+$/, "");
-    this.#fetch = opts.fetchImpl ?? ((...a) => fetch(...a));
+    this.#fetch = opts.fetchImpl ?? ((url, init) => fetch(url, { ...init, signal: AbortSignal.timeout(30_000) }));
     this.now = opts.now ?? Date.now;
   }
 

@@ -76,7 +76,7 @@ export class PantaClient {
   constructor(opts: PantaClientOptions) {
     this.#apiKey = opts.apiKey;
     this.baseUrl = (opts.baseUrl ?? DEFAULT_PANTA_BASE_URL).replace(/\/+$/, "");
-    this.#fetch = opts.fetchImpl ?? ((...a) => fetch(...a));
+    this.#fetch = opts.fetchImpl ?? ((url, init) => fetch(url, { ...init, signal: AbortSignal.timeout(30_000) }));
     this.#sleep = opts.sleep ?? defaultSleep;
     this.bucket = new TokenBucket(120, 60_000, opts.now ?? Date.now);
   }
