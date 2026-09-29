@@ -13,9 +13,11 @@ Many Panta markets are templated price questions, for example:
 The answer to such a question is a function of the asset's current price, how volatile it is, and how long is left. oddsflow:
 
 1. lists Panta's markets and parses the templated ones into a typed contract (`close_above`, `close_below`, `touch_above`, `touch_below`, `mcap_touch_above`);
-2. resolves the asset to a Solana mint and reads its live price, 1h candles and supply from [Solami](https://solami.dev);
+2. routes each asset to a data venue: Solana-native assets (SOL and any token Hyperliquid does not list) are priced from live DEX data via [Solami](https://solami.dev) (price, 1h candles, supply); large caps that Hyperliquid lists (BTC, ETH, HYPE, ZEC, ...) use Hyperliquid's public mids and 1h candles as the reference price;
 3. computes a **fair probability** from a lognormal model using realised volatility;
 4. shows it next to Panta's YES price, with the **edge** (`fair - YES`).
+
+**Launch radar.** Panta markets open blind at 50/50 on a bonding curve, whatever the question. oddsflow flags primary-phase markets still sitting at about 0.50 (`launchBlind`) and shows the fair price next to that launch price.
 
 If a market cannot be parsed with certainty it is unsupported (`null`), never guessed. Correctness and honesty come before coverage.
 
@@ -91,6 +93,7 @@ Keys are read only from those two environment variables and are never logged, pr
   - `/positions/`
   - `/categories/`
 - Anything else throws `ForbiddenPathError` without touching the network (tested with a fetch spy).
+- `HyperliquidClient` calls `assertHlAllowed` before any network call. Only POST `/info` with body type `allMids`, `meta` or `candleSnapshot` is permitted; `/exchange` and every other request type throw `ForbiddenHlRequestError`. No Hyperliquid key is used.
 - There is no wallet, key-pair or transaction code anywhere in the project.
 - Zero runtime dependencies: only global `fetch`, global `WebSocket` and `node:http`.
 - The UI never presents stale data as live: rows with a spot older than 120 s or a Panta price older than 180 s carry a "stale" badge, are dimmed and are forced to low confidence; if the browser loses its connection to the server, every row is marked as not live.
@@ -99,6 +102,7 @@ Keys are read only from those two environment variables and are never logged, pr
 
 - **Driftless lognormal.** No drift, no jumps, no volatility smile or clustering. Crypto returns are fat-tailed, so tail probabilities are likely understated. Volatility is backward-looking (7 days of hourly candles).
 - **Touch probabilities assume continuous monitoring.** Real resolution may use discrete prices, which makes the model slightly high.
+- **Venue mismatch.** Hyperliquid mids are perpetual-swap prices, not spot; Panta may resolve against something else. SOL is priced on Solami and its basis against the Hyperliquid mid is shown for information only.
 - **Wrapped or tokenised assets can deviate from the underlying.** Only SOL and USDC are hardcoded. Every other symbol is resolved by a Solami symbol search (exact symbol match, highest liquidity), which can return a bridged token or a different token with the same ticker. Such rows carry a note. Panta may resolve against a different price source than a Solana DEX.
 - **Solami response shapes are unverified.** Extractors accept several plausible shapes and return null rather than guess, but a shape change means "no data", not wrong data. Panta response shapes (`nextCursor`, YES price field names, the `status` list filter) are likewise handled defensively and are unverified; run `npm run live-check` with real keys to confirm.
 - **Market-cap contracts** need a supply figure. Circulating supply is preferred; if only total supply is available the row is marked low confidence.
@@ -113,4 +117,4 @@ The code was written with an AI coding assistant, and reviewed and tested by the
 
 MIT, see [LICENSE](LICENSE).
 
-Powered by Panta. Data: Solami.
+Powered by Panta. Data: Solami. Reference prices: Hyperliquid.

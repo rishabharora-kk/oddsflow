@@ -1,5 +1,5 @@
 /**
- * The engine: Panta markets -> parsed contracts -> Solana mints -> spot/sigma/supply -> fair value rows.
+ * The engine: Panta markets -> parsed contracts -> venue (Hyperliquid or Solami) -> spot/sigma/supply -> fair value rows.
  * All I/O goes through injected dependencies so it can be tested with fakes.
  * Read-only: nothing here trades, signs or broadcasts.
  */
@@ -7,6 +7,8 @@ import { parseMarket } from "./parse/market.ts";
 import type { Contract } from "./parse/market.ts";
 import { fairValue, realizedVol } from "./model/fair.ts";
 import { resolveMint } from "./assets/resolve.ts";
+import { venueFor } from "./assets/venue.ts";
+import type { Venue } from "./assets/venue.ts";
 import type { MintSearcher } from "./assets/resolve.ts";
 import { categoryRank, extractMarketId, extractResolved, extractTitle, extractYesPrice } from "./panta/extract.ts";
 import { isStale } from "./util/stale.ts";
@@ -21,6 +23,13 @@ export type SolamiLike = MintSearcher & {
   price(mint: string): Promise<{ priceUsd: number; asOfSec: number; asOfKnown?: boolean } | null>;
   ohlcv(mint: string, interval: "1h", limit: number): Promise<number[] | null>;
   supply(mint: string): Promise<SupplyInfo | null>;
+};
+
+/** The read-only slice of the Hyperliquid client the engine uses. */
+export type HlLike = {
+  mids(): Promise<Record<string, number>>;
+  universe(): Promise<Set<string>>;
+  closes(coin: string, interval: "1h", hours: number): Promise<{ closes: number[]; lastT: number } | null>;
 };
 
 export type SpotSource = {
@@ -58,16 +67,28 @@ export type Row = {
   stale: boolean;
   staleReasons: string[];
   notes: string[];
+  /** Which data path priced this row; null for markets that are not price contracts. */
+  venue: Venue | null;
+  /** Panta market phase ("primary", "secondary", "resolved", ...). */
+  phase: string | null;
+  /** A primary-phase market still sitting at the 50/50 bonding-curve launch price (|yes - 0.5| < 0.01). */
+  launchBlind: boolean;
+  /** Informational: (Solami spot / Hyperliquid mid - 1) * 100 when both venues price the asset. */
+  basisPct: number | null;
 };
 
 export type EngineOptions = {
   panta: PantaLike;
-  solami: SolamiLike;
+  /** Null when no Solami key is configured: Solami-venue rows then have no mint. */
+  solami: SolamiLike | null;
+  hyperliquid?: HlLike | null;
   stream?: SpotSource | null;
   now?: () => number;
   phases?: string[];
   maxDetailPerCycle?: number;
   maxTextPerCycle?: number;
+  hlMidsMinIntervalSec?: number;
+  hlUniverseTtlSec?: number;
   sigmaTtlSec?: number;
   supplyTtlSec?: number;
   retrySec?: number;
@@ -90,6 +111,7 @@ type Entry = {
   yesFromDetail: boolean;
   resolved: boolean;
   /** Last detail fetch (text or price). */
+  phase: string | null;
   detailAtSec: number | null;
   /** Last attempt to obtain text via the detail endpoint, and how long to wait before the next one. */
   textTriedAtSec: number | null;
@@ -108,20 +130,27 @@ type AssetState = {
   mintSource: "static" | "solami-search" | null;
   mintTriedAt: number | null;
   vol: { sigma: number | null; n: number; at: number; ok: boolean } | null;
+  /** Hyperliquid candle volatility (used when the asset's venue is Hyperliquid). */
+  hlVol: { sigma: number | null; n: number; at: number; ok: boolean } | null;
   supply: { info: SupplyInfo | null; at: number; ok: boolean } | null;
   rest: { quote: SpotQuote; at: number } | null;
 };
 
 const HOUR_SEC = 3600;
+const HL_CANDLE_HOURS = 168;
+const NO_COINS: Set<string> = new Set();
 
 export class Engine {
   panta: PantaLike;
-  solami: SolamiLike;
+  solami: SolamiLike | null;
+  hyperliquid: HlLike | null;
   stream: SpotSource | null;
   now: () => number;
   phases: string[];
   maxDetailPerCycle: number;
   maxTextPerCycle: number;
+  hlMidsMinIntervalSec: number;
+  hlUniverseTtlSec: number;
   sigmaTtlSec: number;
   supplyTtlSec: number;
   retrySec: number;
@@ -130,6 +159,9 @@ export class Engine {
 
   #entries = new Map<string, Entry>();
   #order = 0;
+  #hlUniverse: Set<string> | null = null;
+  #hlUniverseTriedAt: number | null = null;
+  #hlMids: { map: Record<string, number>; at: number } | null = null;
   #assets = new Map<string, AssetState>();
   #listeners = new Set<(rows: Row[]) => void>();
   #timers: Array<ReturnType<typeof setInterval>> = [];
@@ -142,11 +174,14 @@ export class Engine {
   constructor(o: EngineOptions) {
     this.panta = o.panta;
     this.solami = o.solami;
+    this.hyperliquid = o.hyperliquid ?? null;
     this.stream = o.stream ?? null;
     this.now = o.now ?? Date.now;
     this.phases = o.phases ?? ["primary", "secondary"];
     this.maxDetailPerCycle = o.maxDetailPerCycle ?? 90;
     this.maxTextPerCycle = o.maxTextPerCycle ?? 200;
+    this.hlMidsMinIntervalSec = o.hlMidsMinIntervalSec ?? 15;
+    this.hlUniverseTtlSec = o.hlUniverseTtlSec ?? 3600;
     this.sigmaTtlSec = o.sigmaTtlSec ?? 600;
     this.supplyTtlSec = o.supplyTtlSec ?? 3600;
     this.retrySec = o.retrySec ?? 120;
@@ -177,7 +212,7 @@ export class Engine {
       if (!e) {
         e = {
           id, title: "", hasText: false, contract: null, category: null, order: this.#order++,
-          yes: null, yesAsOfSec: null, yesFromDetail: false, resolved: false,
+          yes: null, yesAsOfSec: null, yesFromDetail: false, resolved: false, phase: null,
           detailAtSec: null, textTriedAtSec: null, textRetrySec: STRIPPED_RETRY_SEC,
         };
         this.#entries.set(id, e);
@@ -194,7 +229,8 @@ export class Engine {
         e.yes = yes;
         e.yesAsOfSec = atSec;
       }
-      if (!e.detailAtSec && extractResolved(item)) e.resolved = true;
+      if (typeof item?.phase === "string" && item.phase !== "") e.phase = item.phase;
+      if (!e.detailAtSec && (extractResolved(item) || item?.phase === "resolved")) e.resolved = true;
     }
     if (prune) for (const id of [...this.#entries.keys()]) if (!seenIds.has(id)) this.#entries.delete(id);
     return seenIds.size;
@@ -233,6 +269,7 @@ export class Engine {
     }
     const resolved = extractResolved(d);
     if (resolved !== null) e.resolved = resolved;
+    if (typeof d?.phase === "string" && d.phase !== "") e.phase = d.phase;
     if (!e.hasText) {
       const text = extractTitle(d);
       e.textTriedAtSec = at;
@@ -294,7 +331,7 @@ export class Engine {
   #asset(symbol: string): AssetState {
     let a = this.#assets.get(symbol);
     if (!a) {
-      a = { mint: null, mintSource: null, mintTriedAt: null, vol: null, supply: null, rest: null };
+      a = { mint: null, mintSource: null, mintTriedAt: null, vol: null, hlVol: null, supply: null, rest: null };
       this.#assets.set(symbol, a);
     }
     return a;
@@ -313,15 +350,51 @@ export class Engine {
     return out;
   }
 
-  /** Resolve mints, sigma and supply for every asset that has a live contract, honouring TTLs. */
+  #venue(symbol: string): Venue | null {
+    return venueFor(symbol, this.#hlUniverse ?? NO_COINS);
+  }
+
+  /** The Hyperliquid perp universe, refreshed hourly (retried every `retrySec` after a failure). */
+  async #refreshHlUniverse(): Promise<void> {
+    if (!this.hyperliquid) return;
+    const now = this.#nowSec();
+    const ttl = this.#hlUniverse && this.#hlUniverse.size > 0 ? this.hlUniverseTtlSec : this.retrySec;
+    if (this.#hlUniverseTriedAt !== null && now - this.#hlUniverseTriedAt < ttl) return;
+    this.#hlUniverseTriedAt = now;
+    try {
+      const u = await this.hyperliquid.universe();
+      if (u.size > 0) this.#hlUniverse = u;
+    } catch (e) {
+      console.warn(`[engine] hyperliquid universe failed: ${(e as Error)?.message ?? "error"}`);
+    }
+  }
+
+  /** Resolve venues, mints, sigma and supply for every asset that has a live contract, honouring TTLs. */
   async refreshAssetData(): Promise<void> {
+    await this.#refreshHlUniverse();
     const now = this.#nowSec();
     for (const [symbol, need] of this.#activeAssets()) {
       const a = this.#asset(symbol);
+      if (this.#venue(symbol) === "hyperliquid") {
+        const ttl = a.hlVol?.ok ? this.sigmaTtlSec : this.retrySec;
+        if (!a.hlVol || now - a.hlVol.at >= ttl) {
+          try {
+            const r = await this.hyperliquid!.closes(symbol, "1h", HL_CANDLE_HOURS);
+            const sigma = r ? realizedVol(r.closes, HOUR_SEC) : null;
+            a.hlVol = { sigma, n: r?.closes.length ?? 0, at: this.#nowSec(), ok: sigma !== null };
+          } catch (e) {
+            console.warn(`[engine] hyperliquid candles failed for ${symbol}: ${(e as Error)?.message ?? "error"}`);
+            a.hlVol = { sigma: a.hlVol?.sigma ?? null, n: a.hlVol?.n ?? 0, at: this.#nowSec(), ok: false };
+          }
+        }
+        continue;
+      }
+      const solami = this.solami;
+      if (!solami) continue;
       if (!a.mint && (a.mintTriedAt === null || now - a.mintTriedAt >= this.retrySec)) {
         a.mintTriedAt = now;
         try {
-          const r = await resolveMint(symbol, this.solami);
+          const r = await resolveMint(symbol, solami);
           if (r) {
             a.mint = r.mint;
             a.mintSource = r.source;
@@ -335,7 +408,7 @@ export class Engine {
       const volTtl = a.vol?.ok ? this.sigmaTtlSec : this.retrySec;
       if (!a.vol || now - a.vol.at >= volTtl) {
         try {
-          const closes = await this.solami.ohlcv(a.mint, "1h", 168);
+          const closes = await solami.ohlcv(a.mint, "1h", 168);
           const sigma = closes ? realizedVol(closes, HOUR_SEC) : null;
           a.vol = { sigma, n: closes?.length ?? 0, at: this.#nowSec(), ok: sigma !== null };
         } catch (e) {
@@ -348,7 +421,7 @@ export class Engine {
         const supTtl = a.supply?.ok ? this.supplyTtlSec : this.retrySec;
         if (!a.supply || now - a.supply.at >= supTtl) {
           try {
-            const info = await this.solami.supply(a.mint);
+            const info = await solami.supply(a.mint);
             a.supply = { info, at: this.#nowSec(), ok: info !== null };
           } catch (e) {
             console.warn(`[engine] supply failed for ${symbol}: ${(e as Error)?.message ?? "error"}`);
@@ -361,8 +434,16 @@ export class Engine {
     this.stream?.setMints?.(mints);
   }
 
-  /** Best spot for an asset: the fresher of the stream and a REST quote. */
-  #spot(a: AssetState): SpotQuote | null {
+  /** Hyperliquid mid for a coin, as of the time the mids were fetched. */
+  #hlSpot(symbol: string): SpotQuote | null {
+    const m = this.#hlMids;
+    const px = m?.map[symbol];
+    return m && typeof px === "number" && px > 0 ? { priceUsd: px, asOfSec: m.at } : null;
+  }
+
+  /** Best spot for an asset: the venue's own quote (Hyperliquid mid, or the fresher of Solami stream and REST). */
+  #spot(a: AssetState, symbol: string): SpotQuote | null {
+    if (this.#venue(symbol) === "hyperliquid") return this.#hlSpot(symbol);
     const s = a.mint ? (this.stream?.latest(a.mint) ?? null) : null;
     const r = a.rest?.quote ?? null;
     if (s && r) return r.asOfSec > s.asOfSec ? r : s;
@@ -372,14 +453,29 @@ export class Engine {
   /** Top up spot with REST quotes for any asset whose stream data is missing or stale. */
   async refreshSpots(): Promise<void> {
     const now = this.#nowSec();
-    for (const symbol of this.#activeAssets().keys()) {
+    const active = [...this.#activeAssets().keys()];
+    // Hyperliquid mids: needed by Hyperliquid-venue rows and for the SOL cross-venue basis.
+    if (this.hyperliquid && this.#hlUniverse && active.some((s) => this.#hlUniverse!.has(s))) {
+      if (!this.#hlMids || now - this.#hlMids.at >= this.hlMidsMinIntervalSec) {
+        try {
+          const map = await this.hyperliquid.mids();
+          if (Object.keys(map).length > 0) this.#hlMids = { map, at: this.#nowSec() };
+        } catch (e) {
+          console.warn(`[engine] hyperliquid mids failed: ${(e as Error)?.message ?? "error"}`);
+        }
+      }
+    }
+    const solami = this.solami;
+    for (const symbol of active) {
+      if (!solami) break;
+      if (this.#venue(symbol) !== "solami") continue;
       const a = this.#asset(symbol);
       if (!a.mint) continue;
-      const cur = this.#spot(a);
+      const cur = this.#spot(a, symbol);
       if (cur && !isStale(cur.asOfSec, now)) continue;
       if (a.rest && now - a.rest.at < this.restSpotMinIntervalSec) continue;
       try {
-        const q = await this.solami.price(a.mint);
+        const q = await solami.price(a.mint);
         if (q) a.rest = { quote: { priceUsd: q.priceUsd, asOfSec: q.asOfSec }, at: this.#nowSec() };
         else a.rest = { quote: a.rest?.quote ?? { priceUsd: NaN, asOfSec: 0 }, at: this.#nowSec() };
       } catch (e) {
@@ -429,24 +525,41 @@ export class Engine {
       stale: false,
       staleReasons: [],
       notes: [],
+      venue: null,
+      phase: e.phase,
+      launchBlind: e.phase === "primary" && e.yes !== null && Math.abs(e.yes - 0.5) < 0.01,
+      basisPct: null,
     };
     if (!c) return { ...base, reason: "unparsed" };
     if (e.resolved) return { ...base, reason: "resolved" };
     if (c.expiry <= nowSec) return { ...base, reason: "expired" };
 
+    const venue = this.#venue(c.asset);
+    base.venue = venue;
+    const onHl = venue === "hyperliquid";
     const a = this.#assets.get(c.asset);
-    if (!a || !a.mint) return { ...base, reason: "no mint" };
-    base.mint = a.mint;
-    base.mintSource = a.mintSource;
-    base.nCandles = a.vol?.n ?? null;
+    if (onHl) {
+      if (!a) return { ...base, reason: "no spot" };
+    } else if (!a || !a.mint) {
+      return { ...base, reason: "no mint" };
+    }
+    const vol = onHl ? a.hlVol : a.vol;
+    base.mint = onHl ? null : a.mint;
+    base.mintSource = onHl ? null : a.mintSource;
+    base.nCandles = vol?.n ?? null;
     base.supply = a.supply?.info?.supply ?? null;
 
-    const spot = this.#spot(a);
+    const spot = this.#spot(a, c.asset);
     if (!spot) return { ...base, reason: "no spot" };
     base.spot = spot.priceUsd;
     base.asOf = spot.asOfSec;
+    if (!onHl) {
+      // Cross-venue check, informational only: the Solami price against the Hyperliquid mid (SOL trades on both).
+      const hl = this.#hlSpot(c.asset);
+      if (hl && !isStale(hl.asOfSec, nowSec) && !isStale(spot.asOfSec, nowSec)) base.basisPct = (spot.priceUsd / hl.priceUsd - 1) * 100;
+    }
 
-    const sigma = a.vol?.sigma ?? null;
+    const sigma = vol?.sigma ?? null;
     if (sigma === null || !(sigma > 0)) {
       return { ...base, sigma, reason: sigma === 0 ? "no sigma (flat candles)" : "no sigma" };
     }
@@ -458,7 +571,7 @@ export class Engine {
       spot: spot.priceUsd,
       spotAsOfSec: spot.asOfSec,
       sigma,
-      nCandles: a.vol?.n ?? 0,
+      nCandles: vol?.n ?? 0,
       supply: a.supply?.info?.supply ?? null,
       nowSec,
     });
@@ -476,7 +589,8 @@ export class Engine {
       confidence = "low";
       notes.push(`supply is the ${a.supply.info.kind} supply, not circulating supply`);
     }
-    if (a.mintSource === "solami-search") notes.push("mint chosen by symbol search; may be a wrapped/bridged token, not the underlying");
+    if (onHl) notes.push("reference price is the Hyperliquid perpetual mid, not a Solana DEX price");
+    if (a.mintSource === "solami-search" && !onHl) notes.push("mint chosen by symbol search; may be a wrapped/bridged token, not the underlying");
 
     return {
       ...base,
@@ -559,13 +673,18 @@ export class Engine {
     this.#timers = [];
   }
 
-  status(): { running: boolean; markets: number; supported: number; lastMarketsAt: number | null; error: string | null; streamMode: string | null } {
+  status(): { running: boolean; markets: number; supported: number; launchBlind: number; lastMarketsAt: number | null; error: string | null; streamMode: string | null } {
     let supported = 0;
-    for (const e of this.#entries.values()) if (e.contract) supported++;
+    let launchBlind = 0;
+    for (const e of this.#entries.values()) {
+      if (e.contract) supported++;
+      if (e.phase === "primary" && e.yes !== null && Math.abs(e.yes - 0.5) < 0.01) launchBlind++;
+    }
     return {
       running: this.#running,
       markets: this.#entries.size,
       supported,
+      launchBlind,
       lastMarketsAt: this.lastMarketsAtSec,
       error: this.lastError,
       streamMode: this.stream?.mode ?? null,

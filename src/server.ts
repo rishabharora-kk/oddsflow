@@ -85,6 +85,7 @@ async function main(): Promise<void> {
   const { PantaClient } = await import("./panta/client.ts");
   const { SolamiClient, BlurStream } = await import("./feed/solami.ts");
   const { Engine } = await import("./engine.ts");
+  const { HyperliquidClient } = await import("./feed/hyperliquid.ts");
 
   const pantaKey = process.env.PANTA_API_KEY;
   const solamiKey = process.env.SOLAMI_API_KEY;
@@ -102,7 +103,8 @@ async function main(): Promise<void> {
     : { search: failing("SOLAMI_API_KEY"), price: failing("SOLAMI_API_KEY"), ohlcv: failing("SOLAMI_API_KEY"), supply: failing("SOLAMI_API_KEY") };
   const stream = solamiKey && solami instanceof SolamiClient ? new BlurStream({ apiKey: solamiKey, rest: solami }) : null;
 
-  const engine = new Engine({ panta, solami, stream });
+  // Hyperliquid's public info API needs no key and is read-only (see assertHlAllowed).
+  const engine = new Engine({ panta, solami, hyperliquid: new HyperliquidClient(), stream });
   const server = createAppServer(engine, { hasPanta: !!pantaKey, hasSolami: !!solamiKey });
   server.listen(port, host, () => {
     console.log(`oddsflow listening on http://${host}:${port} (read-only)`);

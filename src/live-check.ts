@@ -9,7 +9,9 @@ import { parseMarket } from "./parse/market.ts";
 import type { Contract } from "./parse/market.ts";
 import { SolamiClient } from "./feed/solami.ts";
 import { Engine } from "./engine.ts";
-import type { PantaLike, SolamiLike } from "./engine.ts";
+import type { HlLike, PantaLike, SolamiLike } from "./engine.ts";
+import { HyperliquidClient } from "./feed/hyperliquid.ts";
+import { venueFor } from "./assets/venue.ts";
 import { categoryRank, extractCategory, extractMarketId, extractTitle } from "./panta/extract.ts";
 import { redactSecrets } from "./util/redact.ts";
 
@@ -19,6 +21,8 @@ const MAX_DETAILS = 60;
 export type LiveCheckDeps = {
   panta?: PantaLike;
   solami?: SolamiLike;
+  /** Hyperliquid needs no key, so a real client is always tried, except when a fake Panta is injected (tests). */
+  hyperliquid?: HlLike | null;
   log?: (line: string) => void;
 };
 
@@ -145,42 +149,74 @@ export async function runLiveCheck(env: Record<string, string | undefined>, deps
   log("example parsed markets:");
   for (const p of parsed.slice(0, 5)) log(`  ${JSON.stringify(p.title)} -> ${JSON.stringify(p.contract)}`);
 
-  const solami = deps.solami ?? (env.SOLAMI_API_KEY ? new SolamiClient({ apiKey: env.SOLAMI_API_KEY }) : null);
-  if (!solami) {
-    log("SOLAMI_API_KEY is not set; skipping fair-value check.");
-    return 0;
-  }
-
-  // Up to 5 contracts, preferring distinct assets so the check exercises more than one mint.
-  const picked: typeof parsed = [];
-  const seenAssets = new Set<string>();
-  for (const p of parsed) {
-    if (picked.length >= 5) break;
-    if (!seenAssets.has(p.contract.asset)) {
-      seenAssets.add(p.contract.asset);
-      picked.push(p);
+  // Hyperliquid: public, no key. A failure here is logged and never fails the run.
+  const hl: HlLike | null = deps.hyperliquid !== undefined ? deps.hyperliquid : deps.panta === undefined ? new HyperliquidClient() : null;
+  let universe = new Set<string>();
+  if (hl) {
+    try {
+      universe = await hl.universe();
+    } catch (e) {
+      log(`Hyperliquid universe call failed: ${safe(e)}`);
     }
   }
-  for (const p of parsed) {
-    if (picked.length >= 5) break;
-    if (!picked.includes(p)) picked.push(p);
+  if (env.ODDSFLOW_DIAG === "1") {
+    const assets = [...new Set(parsed.map((p) => p.contract.asset))].sort();
+    log(`diag: hl universe has ${universe.size} coins; routed: ${assets.map((a) => `${a}=${venueFor(a, universe)}`).join(", ") || "(none)"}`);
   }
+
+  const solami = deps.solami ?? (env.SOLAMI_API_KEY ? new SolamiClient({ apiKey: env.SOLAMI_API_KEY }) : null);
+  if (!solami) log("SOLAMI_API_KEY is not set; skipping fair-value check.");
+
+  // Hyperliquid-venue contracts: up to 5 unexpired ones. Solami-venue contracts: up to 5, preferring distinct assets.
+  const hlPicked = hl ? live.filter((p) => venueFor(p.contract.asset, universe) === "hyperliquid").slice(0, 5) : [];
+  const solamiCandidates = parsed.filter((p) => venueFor(p.contract.asset, universe) === "solami");
+  const solamiPicked: typeof parsed = [];
+  if (solami) {
+    const seenAssets = new Set<string>();
+    for (const p of solamiCandidates) {
+      if (solamiPicked.length >= 5) break;
+      if (!seenAssets.has(p.contract.asset)) {
+        seenAssets.add(p.contract.asset);
+        solamiPicked.push(p);
+      }
+    }
+    for (const p of solamiCandidates) {
+      if (solamiPicked.length >= 5) break;
+      if (!solamiPicked.includes(p)) solamiPicked.push(p);
+    }
+  }
+  if (hlPicked.length === 0 && solamiPicked.length === 0) return 0;
 
   try {
-    const engine = new Engine({ panta, solami, stream: null });
-    engine.ingestMarkets(picked.map((p) => p.item));
+    const engine = new Engine({ panta, solami: solami ?? null, hyperliquid: hl, stream: null });
+    engine.ingestMarkets([...hlPicked, ...solamiPicked].map((p) => p.item));
     const rows = await engine.runOnce();
-    log("fair-value rows:");
-    for (const r of rows) {
+
+    const f4 = (x: number | null) => (x === null ? "n/a" : x.toFixed(4));
+    for (const r of rows.filter((x) => x.venue === "hyperliquid")) {
+      const spot = r.spot === null ? "n/a" : String(Number(r.spot.toPrecision(8)));
+      const sigma = r.sigma === null ? "n/a" : r.sigma.toFixed(3);
+      const days = r.T === null ? "n/a" : ((r.T * 31_536_000) / 86_400).toFixed(2);
+      const edge = r.edge === null ? "n/a" : (r.edge >= 0 ? "+" : "") + r.edge.toFixed(4);
       log(
-        "  " +
-          JSON.stringify({
-            title: r.title, asset: r.asset, kind: r.kind, yes: r.yes, fair: r.fair, edge: r.edge,
-            spot: r.spot, sigma: r.sigma, T: r.T, confidence: r.confidence, reason: r.reason ?? null,
-          }),
+        `fair: ${r.title} | venue=hyperliquid spot=${spot} sigma=${sigma} T=${days}d | panta_yes=${f4(r.yes)} fair=${f4(r.fair)} edge=${edge} launchBlind=${r.launchBlind}` +
+          (r.reason ? ` reason=${r.reason}` : ""),
       );
     }
-    if (rows.length === 0) log("  (no rows)");
+    if (solami) {
+      log("fair-value rows:");
+      const solRows = rows.filter((x) => x.venue !== "hyperliquid");
+      for (const r of solRows) {
+        log(
+          "  " +
+            JSON.stringify({
+              title: r.title, asset: r.asset, kind: r.kind, yes: r.yes, fair: r.fair, edge: r.edge,
+              spot: r.spot, sigma: r.sigma, T: r.T, confidence: r.confidence, reason: r.reason ?? null,
+            }),
+        );
+      }
+      if (solRows.length === 0) log("  (no rows)");
+    }
   } catch (e) {
     log(`fair-value check failed: ${safe(e)}`);
   }

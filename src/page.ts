@@ -48,6 +48,9 @@ export const PAGE = String.raw`<!doctype html>
   dd { margin: 0; word-break: break-all; }
   code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
   footer { color: var(--muted); font-size: 13px; padding-top: 16px; padding-bottom: 28px; display: flex; gap: 16px; flex-wrap: wrap; }
+  .radar { background: var(--panel); border: 1px solid var(--line); border-left: 4px solid var(--link); padding: 8px 12px; border-radius: 6px; margin: 8px 0; }
+  .radar ul { margin: 4px 0 0; padding-left: 18px; }
+  .badge.launch { color: var(--link); border-color: var(--link); font-weight: 600; letter-spacing: .02em; }
   .empty { padding: 24px; text-align: center; color: var(--muted); }
 </style>
 </head>
@@ -56,6 +59,7 @@ export const PAGE = String.raw`<!doctype html>
   <h1>oddsflow</h1>
   <p class="sub">Fair probabilities for Panta price markets, computed from live Solana DEX prices and realised volatility.</p>
   <div class="banner" role="note">Read-only analytics. Not financial advice.</div>
+  <div class="radar" id="radar" role="region" aria-label="Launch radar"></div>
   <div class="status" id="status" aria-live="polite"></div>
 </header>
 <main>
@@ -67,12 +71,13 @@ export const PAGE = String.raw`<!doctype html>
     <div class="empty" id="empty" hidden></div>
   </div>
 </main>
-<footer><span>Powered by Panta</span><span>Data: Solami</span></footer>
+<footer><span>Powered by Panta</span><span>Data: Solami</span><span>Reference prices: Hyperliquid</span></footer>
 <script>
 (function () {
   "use strict";
   var COLS = [
     { key: "title", label: "Market", get: function (r) { return r.title; }, text: true },
+    { key: "venue", label: "Venue", get: function (r) { return r.venue ? VENUE[r.venue] || r.venue : null; }, text: true },
     { key: "yes", label: "Panta YES", get: function (r) { return r.yes; } },
     { key: "fair", label: "Fair", get: function (r) { return r.fair; } },
     { key: "edge", label: "Edge", get: function (r) { return r.edge; } },
@@ -82,6 +87,7 @@ export const PAGE = String.raw`<!doctype html>
     { key: "conf", label: "Confidence", get: function (r) { return r.confidence === "high" ? 2 : r.confidence === "low" ? 1 : null; } },
     { key: "asOf", label: "Updated", get: function (r) { return r.asOf; } }
   ];
+  var VENUE = { hyperliquid: "Hyperliquid mid", solami: "Solami DEX" };
   var rows = [], status = null, sort = { key: "edge", dir: -1, abs: true }, open = {}, connected = false, lastPush = null, showAll = false;
 
   function el(tag, cls, text) {
@@ -156,6 +162,9 @@ export const PAGE = String.raw`<!doctype html>
       touch_below: "P = N((-b + sigma^2 T/2)/v) + (S/K) N((-b - sigma^2 T/2)/v), b = ln(S/K), v = sigma sqrt(T)",
       mcap_touch_above: "touch-above with K = target market cap / supply"
     };
+    add("Venue", r.venue ? (VENUE[r.venue] || r.venue) : null);
+    add("Panta phase", r.phase);
+    if (r.launchBlind) add("Launch", "primary-phase market still at the 50/50 launch price; the fair value is what it should trade at");
     add("Contract", r.kind ? r.kind + " on " + r.asset : "not parsed (unsupported market)");
     add("Formula", r.kind ? formula[r.kind] : null);
     if (r.fair !== null) {
@@ -168,6 +177,7 @@ export const PAGE = String.raw`<!doctype html>
     } else {
       add("Why no fair value", r.reason);
     }
+    if (r.basisPct !== null && r.basisPct !== undefined) add("Cross-venue basis", (r.basisPct >= 0 ? "+" : "") + r.basisPct.toFixed(2) + "% (Solami DEX price vs Hyperliquid mid; informational only)");
     add("Supply", r.supply);
     add("Mint", r.mint ? r.mint + (r.mintSource ? " (" + r.mintSource + ")" : "") : null);
     add("Spot as of", r.asOf ? new Date(r.asOf * 1000).toISOString() : null);
@@ -191,8 +201,10 @@ export const PAGE = String.raw`<!doctype html>
     b.setAttribute("aria-expanded", open[r.marketId] ? "true" : "false");
     b.addEventListener("click", function () { open[r.marketId] = !open[r.marketId]; render(); });
     c0.appendChild(b);
+    if (r.launchBlind) c0.appendChild(el("span", "badge launch", "LAUNCH @50/50"));
     if (r.fair !== null && isStale(r)) c0.appendChild(el("span", "badge stale", "stale"));
     tr.appendChild(c0);
+    tr.appendChild(el("td", r.venue ? null : "muted", r.venue ? (VENUE[r.venue] || r.venue) : "\u2014"));
 
     tr.appendChild(el("td", null, pct(r.yes)));
     tr.appendChild(el("td", r.fair !== null && isStale(r) ? "dim" : null, r.fair !== null ? pct(r.fair) : "—"));
@@ -216,6 +228,33 @@ export const PAGE = String.raw`<!doctype html>
   }
   function isStale(r) { return r.stale || !connected; }
 
+  function renderRadar() {
+    var box = document.getElementById("radar");
+    box.textContent = "";
+    var blind = rows.filter(function (r) { return r.launchBlind; });
+    var n = status && typeof status.launchBlind === "number" ? status.launchBlind : blind.length;
+    var withFair = blind.filter(function (r) { return r.fair !== null; });
+    var head = el("div");
+    head.appendChild(el("strong", null, "Launch radar: "));
+    head.appendChild(document.createTextNode(n === 0
+      ? "no primary markets are sitting at the 50/50 launch price right now."
+      : n + " primary market" + (n === 1 ? "" : "s") + " opened at 50/50. Fair values:" + (withFair.length ? "" : " none yet (no supported price contract or data still loading).")));
+    box.appendChild(head);
+    if (withFair.length) {
+      var ul = el("ul");
+      withFair.forEach(function (r) {
+        var li = el("li");
+        var a = el("a", null, r.title || r.marketId);
+        if (/^https:\/\/www\.panta\.market\/market\//.test(r.url)) { a.href = r.url; a.target = "_blank"; a.rel = "noopener noreferrer"; }
+        li.appendChild(a);
+        li.appendChild(document.createTextNode(" \u2014 Panta " + (r.yes === null ? "n/a" : r.yes.toFixed(2)) + " vs fair " + r.fair.toFixed(2)));
+        if (isStale(r)) li.appendChild(el("span", "badge stale", "stale"));
+        ul.appendChild(li);
+      });
+      box.appendChild(ul);
+    }
+  }
+
   function renderStatus() {
     var s = document.getElementById("status");
     s.textContent = "";
@@ -236,6 +275,7 @@ export const PAGE = String.raw`<!doctype html>
 
   function render() {
     renderHead();
+    renderRadar();
     renderStatus();
     var body = document.getElementById("body");
     body.textContent = "";
