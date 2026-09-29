@@ -10,8 +10,11 @@ import type { Contract } from "./parse/market.ts";
 import { SolamiClient } from "./feed/solami.ts";
 import { Engine } from "./engine.ts";
 import type { PantaLike, SolamiLike } from "./engine.ts";
-import { extractMarketId, extractTitle } from "./panta/extract.ts";
+import { categoryRank, extractCategory, extractMarketId, extractTitle } from "./panta/extract.ts";
 import { redactSecrets } from "./util/redact.ts";
+
+/** Maximum detail requests used to learn market text for list rows that have no title. */
+const MAX_DETAILS = 60;
 
 export type LiveCheckDeps = {
   panta?: PantaLike;
@@ -49,10 +52,35 @@ export async function runLiveCheck(env: Record<string, string | undefined>, deps
     return 1;
   }
 
+  // List rows usually have no title; the detail endpoint does. Fetch details for empty-title rows (crypto, stocks,
+  // commodities and finance first, at most MAX_DETAILS) and parse the detail text.
+  const programIds = new Set<string>();
+  const detailByIndex = new Map<number, any>();
+  const needText = items
+    .map((item, index) => ({ item, index }))
+    .filter(({ item }) => extractTitle(item) === "" && extractMarketId(item) !== null)
+    .sort((a, b) => categoryRank(extractCategory(a.item)) - categoryRank(extractCategory(b.item)) || a.index - b.index)
+    .slice(0, MAX_DETAILS);
+  let detailFailures = 0;
+  for (const { item, index } of needText) {
+    try {
+      const d = await panta.getMarket(extractMarketId(item) as string);
+      detailByIndex.set(index, d);
+      if (typeof d?.programId === "string" && d.programId !== "") programIds.add(d.programId);
+    } catch {
+      detailFailures++;
+    }
+  }
+  // Items as the engine will see them: the list row, with the detail's text filled in where the list had none.
+  const merged = items.map((item, index) => {
+    const d = detailByIndex.get(index);
+    return d ? { ...item, title: d.title ?? item?.title, question: d.question ?? item?.question } : item;
+  });
+
   const parsed: Array<{ item: any; title: string; contract: Contract }> = [];
   const byKind: Record<string, number> = {};
   let unsupported = 0;
-  for (const item of items) {
+  for (const item of merged) {
     const contract = parseMarket({ title: item?.title, question: item?.question });
     if (!contract) {
       unsupported++;
@@ -76,12 +104,18 @@ export async function runLiveCheck(env: Record<string, string | undefined>, deps
       try {
         const d = await panta.getMarket(id);
         const text = String(d?.title || d?.question || "");
+        if (typeof d?.programId === "string" && d.programId !== "") programIds.add(d.programId);
         log(`diag: detail keys=${Object.keys(d ?? {}).sort().join(",")}`);
         log(`diag: detail text=${JSON.stringify(text.slice(0, 160))} yes=${JSON.stringify(d?.yesPrice)} -> ${JSON.stringify(parseMarket({ title: d?.title, question: d?.question }))}`);
       } catch (e) {
         log(`diag: detail failed: ${safe(e)}`);
       }
     }
+  }
+
+  if (env.ODDSFLOW_DIAG === "1") {
+    log(`diag: details fetched for text=${needText.length - detailFailures} failed=${detailFailures} (list rows with empty title: ${items.filter((it) => extractTitle(it) === "").length})`);
+    log(`diag: programIds seen: ${programIds.size ? [...programIds].sort().join(",") : "(none)"}`);
   }
 
   log(`total markets: ${items.length}`);

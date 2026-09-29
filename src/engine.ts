@@ -8,7 +8,7 @@ import type { Contract } from "./parse/market.ts";
 import { fairValue, realizedVol } from "./model/fair.ts";
 import { resolveMint } from "./assets/resolve.ts";
 import type { MintSearcher } from "./assets/resolve.ts";
-import { extractMarketId, extractTitle, extractYesPrice } from "./panta/extract.ts";
+import { categoryRank, extractMarketId, extractResolved, extractTitle, extractYesPrice } from "./panta/extract.ts";
 import { isStale } from "./util/stale.ts";
 import type { SpotQuote, SupplyInfo } from "./feed/solami.ts";
 
@@ -67,6 +67,7 @@ export type EngineOptions = {
   now?: () => number;
   phases?: string[];
   maxDetailPerCycle?: number;
+  maxTextPerCycle?: number;
   sigmaTtlSec?: number;
   supplyTtlSec?: number;
   retrySec?: number;
@@ -76,13 +77,31 @@ export type EngineOptions = {
 
 type Entry = {
   id: string;
+  /** Market text (title, else question). Empty until known. List rows usually have no title; the detail endpoint does. */
   title: string;
+  /** True once `title` holds real text (from the list row or from a detail fetch). Cached for the life of the id. */
+  hasText: boolean;
   contract: Contract | null;
+  category: string | null;
+  order: number;
   yes: number | null;
   yesAsOfSec: number | null;
-  listHasYes: boolean;
+  /** True once a detail response supplied the price; the list price then never overrides it. */
+  yesFromDetail: boolean;
+  resolved: boolean;
+  /** Last detail fetch (text or price). */
   detailAtSec: number | null;
+  /** Last attempt to obtain text via the detail endpoint, and how long to wait before the next one. */
+  textTriedAtSec: number | null;
+  textRetrySec: number;
 };
+
+/** A detail with no title and no question ("stripped" card) is retried at most this often. */
+const STRIPPED_RETRY_SEC = 600;
+/** A failed detail request (network/API error) is retried sooner. */
+const ERROR_RETRY_SEC = 60;
+/** Parseable markets get their detail re-read for prices this often. */
+const PRICE_REFRESH_SEC = 60;
 
 type AssetState = {
   mint: string | null;
@@ -102,6 +121,7 @@ export class Engine {
   now: () => number;
   phases: string[];
   maxDetailPerCycle: number;
+  maxTextPerCycle: number;
   sigmaTtlSec: number;
   supplyTtlSec: number;
   retrySec: number;
@@ -109,6 +129,7 @@ export class Engine {
   pantaMaxAgeSec: number;
 
   #entries = new Map<string, Entry>();
+  #order = 0;
   #assets = new Map<string, AssetState>();
   #listeners = new Set<(rows: Row[]) => void>();
   #timers: Array<ReturnType<typeof setInterval>> = [];
@@ -125,6 +146,7 @@ export class Engine {
     this.now = o.now ?? Date.now;
     this.phases = o.phases ?? ["primary", "secondary"];
     this.maxDetailPerCycle = o.maxDetailPerCycle ?? 90;
+    this.maxTextPerCycle = o.maxTextPerCycle ?? 200;
     this.sigmaTtlSec = o.sigmaTtlSec ?? 600;
     this.supplyTtlSec = o.supplyTtlSec ?? 3600;
     this.retrySec = o.retrySec ?? 120;
@@ -150,22 +172,29 @@ export class Engine {
       const id = extractMarketId(item);
       if (!id || seenIds.has(id)) continue;
       seenIds.add(id);
-      const title = extractTitle(item);
+      const listText = extractTitle(item);
       let e = this.#entries.get(id);
       if (!e) {
-        e = { id, title, contract: null, yes: null, yesAsOfSec: null, listHasYes: false, detailAtSec: null };
+        e = {
+          id, title: "", hasText: false, contract: null, category: null, order: this.#order++,
+          yes: null, yesAsOfSec: null, yesFromDetail: false, resolved: false,
+          detailAtSec: null, textTriedAtSec: null, textRetrySec: STRIPPED_RETRY_SEC,
+        };
         this.#entries.set(id, e);
       }
-      if (e.title !== title || e.contract === null) {
-        e.title = title;
+      e.category = typeof item?.category === "string" ? item.category : (item?.category?.name ?? item?.category?.slug ?? null);
+      // A list row with real text wins. An empty list title keeps any text cached from a detail fetch.
+      if (listText !== "" && listText !== e.title) {
+        e.title = listText;
+        e.hasText = true;
         e.contract = parseMarket({ title: item?.title, question: item?.question });
       }
       const yes = extractYesPrice(item);
-      e.listHasYes = yes !== null;
-      if (yes !== null) {
+      if (yes !== null && !e.yesFromDetail) {
         e.yes = yes;
         e.yesAsOfSec = atSec;
       }
+      if (!e.detailAtSec && extractResolved(item)) e.resolved = true;
     }
     if (prune) for (const id of [...this.#entries.keys()]) if (!seenIds.has(id)) this.#entries.delete(id);
     return seenIds.size;
@@ -192,26 +221,69 @@ export class Engine {
     this.lastError = errors.length ? `Panta list partially failed (${errors.join("; ")})` : null;
   }
 
-  /** Fetch detail for parseable markets: new ones, and (when the list carries no prices) stale ones. Oldest first, budgeted. */
+  /** Apply a detail response: price (yesPrice, else lastYesPrice), resolved flag, and text if the market has none yet. */
+  #applyDetail(e: Entry, d: any): void {
+    const at = this.#nowSec();
+    e.detailAtSec = at;
+    const yes = extractYesPrice(d);
+    if (yes !== null) {
+      e.yes = yes;
+      e.yesAsOfSec = at;
+      e.yesFromDetail = true;
+    }
+    const resolved = extractResolved(d);
+    if (resolved !== null) e.resolved = resolved;
+    if (!e.hasText) {
+      const text = extractTitle(d);
+      e.textTriedAtSec = at;
+      if (text !== "") {
+        e.title = text;
+        e.hasText = true;
+        e.contract = parseMarket({ title: d?.title, question: d?.question });
+      } else {
+        e.textRetrySec = STRIPPED_RETRY_SEC; // stripped card: no title, no question
+      }
+    }
+  }
+
+  /**
+   * Detail fetches, in two phases per call.
+   *  1. Text: markets whose list row had no title get ONE detail fetch to learn their title/question (cached
+   *     for the life of the id). Crypto, stocks, commodities and finance go first. A stripped detail (no title, no
+   *     question) is retried at most once per 10 minutes.
+   *  2. Prices: parseable, unresolved markets have their detail re-read every 60 s, oldest first, budgeted.
+   * Both phases go through the client's rate limiter. Returns the number of detail requests made.
+   */
   async fetchDetails(budget: number = this.maxDetailPerCycle): Promise<number> {
-    const now = this.#nowSec();
-    const due = [...this.#entries.values()]
-      .filter((e) => e.contract !== null && (e.detailAtSec === null || (!e.listHasYes && now - e.detailAtSec >= 60)))
-      .sort((a, b) => (a.detailAtSec ?? -1) - (b.detailAtSec ?? -1))
-      .slice(0, budget);
     let n = 0;
-    for (const e of due) {
+    const now = this.#nowSec();
+    const needText = [...this.#entries.values()]
+      .filter((e) => !e.hasText && (e.textTriedAtSec === null || now - e.textTriedAtSec >= e.textRetrySec))
+      .sort((a, b) => categoryRank(a.category) - categoryRank(b.category) || a.order - b.order)
+      .slice(0, this.maxTextPerCycle);
+    for (const e of needText) {
       try {
-        const d = await this.panta.getMarket(e.id);
-        const yes = extractYesPrice(d);
-        if (yes !== null) {
-          e.yes = yes;
-          e.yesAsOfSec = this.#nowSec();
-        }
+        this.#applyDetail(e, await this.panta.getMarket(e.id));
       } catch (err) {
         console.warn(`[engine] detail fetch failed for ${e.id}: ${(err as Error)?.message ?? "error"}`);
+        e.textTriedAtSec = this.#nowSec();
+        e.textRetrySec = ERROR_RETRY_SEC;
       }
-      e.detailAtSec = this.#nowSec();
+      n++;
+    }
+
+    const now2 = this.#nowSec();
+    const due = [...this.#entries.values()]
+      .filter((e) => e.contract !== null && !e.resolved && (e.detailAtSec === null || now2 - e.detailAtSec >= PRICE_REFRESH_SEC))
+      .sort((a, b) => (a.detailAtSec ?? -1) - (b.detailAtSec ?? -1))
+      .slice(0, budget);
+    for (const e of due) {
+      try {
+        this.#applyDetail(e, await this.panta.getMarket(e.id));
+      } catch (err) {
+        console.warn(`[engine] detail fetch failed for ${e.id}: ${(err as Error)?.message ?? "error"}`);
+        e.detailAtSec = this.#nowSec(); // do not hammer a failing market; the price ages and shows as stale
+      }
       n++;
     }
     return n;
@@ -233,7 +305,7 @@ export class Engine {
     const out = new Map<string, { needsSupply: boolean }>();
     for (const e of this.#entries.values()) {
       const c = e.contract;
-      if (!c || c.expiry <= now) continue;
+      if (!c || e.resolved || c.expiry <= now) continue;
       const cur = out.get(c.asset) ?? { needsSupply: false };
       if (c.kind === "mcap_touch_above") cur.needsSupply = true;
       out.set(c.asset, cur);
@@ -359,6 +431,7 @@ export class Engine {
       notes: [],
     };
     if (!c) return { ...base, reason: "unparsed" };
+    if (e.resolved) return { ...base, reason: "resolved" };
     if (c.expiry <= nowSec) return { ...base, reason: "expired" };
 
     const a = this.#assets.get(c.asset);

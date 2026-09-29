@@ -52,3 +52,33 @@ export function extractTitle(m: any): string {
   }
   return "";
 }
+
+/**
+ * true/false when the item says whether the market is resolved (`resolved` or `isResolved`), else null.
+ * True wins if either flag is true.
+ */
+export function extractResolved(m: any): boolean | null {
+  if (!m || typeof m !== "object") return null;
+  const a = m.resolved;
+  const b = m.isResolved;
+  if (a === true || b === true) return true;
+  if (a === false || b === false) return false;
+  return null;
+}
+
+/** Category name of a list/detail item, lower-cased; null if absent. */
+export function extractCategory(m: any): string | null {
+  const c = m?.category;
+  const s = typeof c === "string" ? c : (c?.name ?? c?.slug ?? null);
+  return typeof s === "string" && s.trim() !== "" ? s.trim().toLowerCase() : null;
+}
+
+/** Detail-fetch priority: crypto first, then stocks, commodities, finance, then everything else. Lower goes first. */
+export function categoryRank(category: string | null | undefined): number {
+  const c = (category ?? "").toLowerCase();
+  if (c.includes("crypto")) return 0;
+  if (c.includes("stock") || c.includes("equit")) return 1;
+  if (c.includes("commodit")) return 2;
+  if (c.includes("financ")) return 3;
+  return 4;
+}
