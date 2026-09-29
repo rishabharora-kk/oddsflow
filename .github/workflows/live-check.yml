@@ -19,3 +19,4 @@ jobs:
         env:
           PANTA_API_KEY: ${{ secrets.PANTA_API_KEY }}
           SOLAMI_API_KEY: ${{ secrets.SOLAMI_API_KEY }}
+          ODDSFLOW_DIAG: "1"
